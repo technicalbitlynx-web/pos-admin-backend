@@ -150,7 +150,7 @@ async function getDevices(req, res) {
     const onlineMap = new Map(onlineMetas.map((d) => [d.deviceId, d]));
 
     const licenses = await prisma.license.findMany({
-      where: { status: 'ACTIVE', device_id: { not: null } },
+      where: { status: 'ACTIVE' },
       include: {
         client: { select: { business_name: true } },
         subscription: { select: { plan_name: true, expiry_date: true } },

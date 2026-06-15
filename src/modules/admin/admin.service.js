@@ -60,10 +60,19 @@ async function update(id, data) {
 }
 
 async function remove(id) {
+  const exists = await prisma.adminUser.findUnique({ where: { id }, select: { id: true } });
+  if (!exists) throw { statusCode: 404, message: 'Admin not found' };
+
   try {
-    await prisma.adminUser.delete({ where: { id } });
+    await prisma.$transaction([
+      prisma.payment.updateMany({ where: { recorded_by: id },    data: { recorded_by: null } }),
+      prisma.payment.updateMany({ where: { approved_by_id: id }, data: { approved_by_id: null } }),
+      prisma.client.updateMany({  where: { onboarded_by: id },   data: { onboarded_by: null } }),
+      prisma.auditLog.updateMany({ where: { admin_id: id },      data: { admin_id: null } }),
+      prisma.ticketReply.updateMany({ where: { admin_id: id },   data: { admin_id: null } }),
+      prisma.adminUser.delete({ where: { id } }),
+    ]);
   } catch (err) {
-    if (err.code === 'P2025') throw { statusCode: 404, message: 'Admin not found' };
     throw err;
   }
 }

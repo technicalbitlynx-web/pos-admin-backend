@@ -114,7 +114,7 @@ async function approve(id, adminId) {
     });
 
     if (payment.subscription_id) {
-      await tx.subscription.update({
+      const sub = await tx.subscription.update({
         where: { id: payment.subscription_id },
         data: { status: 'ACTIVE' },
       });
@@ -122,10 +122,25 @@ async function approve(id, adminId) {
         where: { id: payment.client_id },
         data: { status: 'ACTIVE' },
       });
-      await tx.license.updateMany({
-        where: { subscription_id: payment.subscription_id, status: 'PENDING' },
-        data: { status: 'ACTIVE', activation_date: new Date() },
-      });
+
+      const licenseCount = await tx.license.count({ where: { subscription_id: payment.subscription_id } });
+      if (licenseCount === 0) {
+        await tx.license.create({
+          data: {
+            client_id: payment.client_id,
+            subscription_id: payment.subscription_id,
+            license_key: generateLicenseKey(),
+            status: 'ACTIVE',
+            activation_date: new Date(),
+            expiry_date: sub.expiry_date || null,
+          },
+        });
+      } else {
+        await tx.license.updateMany({
+          where: { subscription_id: payment.subscription_id, status: 'PENDING' },
+          data: { status: 'ACTIVE', activation_date: new Date() },
+        });
+      }
     }
 
     const invoiceNumber = generateInvoiceNumber();

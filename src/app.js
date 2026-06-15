@@ -19,8 +19,20 @@ const posRoutes = require('./modules/pos/pos.routes');
 const app = express();
 
 app.set('trust proxy', 1);
-app.use(helmet());
-app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') || '*', credentials: true }));
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  crossOriginOpenerPolicy: false,
+}));
+app.use(cors({
+  origin: (origin, callback) => {
+    const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!origin || allowed.length === 0 || allowed.includes(origin)) return callback(null, true);
+    // Allow any vercel.app subdomain as fallback
+    if (origin.endsWith('.vercel.app')) return callback(null, true);
+    callback(null, false);
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('combined'));

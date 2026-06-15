@@ -8,11 +8,13 @@ function setupWebSocket(io) {
   const sm = initSocketManager(io);
 
   io.use((socket, next) => {
-    const token    = socket.handshake.auth?.token;
-    const deviceId = socket.handshake.auth?.device_id;
+    const token      = socket.handshake.auth?.token;
+    const deviceId   = socket.handshake.auth?.device_id;
+    const licenseKey = socket.handshake.auth?.license_key;
 
     if (deviceId) {
-      socket.deviceId = deviceId;
+      socket.deviceId   = deviceId;
+      socket.licenseKey = licenseKey || deviceId; // fallback: old clients sent license key as device_id
       socket.connectionType = 'pos';
       return next();
     }
@@ -35,14 +37,15 @@ function setupWebSocket(io) {
 
     // ── POS device connection ─────────────────────────────────────────────
     if (socket.connectionType === 'pos') {
-      const deviceId = socket.deviceId;
-      logger.info('POS device connected', { deviceId });
+      const deviceId   = socket.deviceId;
+      const licenseKey = socket.licenseKey;
+      logger.info('POS device connected', { deviceId, licenseKey });
 
-      // Look up license → client info
+      // Look up license → client info using the license key
       let licenseInfo = { clientId: null, businessName: 'Unknown', planName: null, expiryDate: null };
       try {
         const license = await prisma.license.findFirst({
-          where: { license_key: deviceId },
+          where: { license_key: licenseKey },
           include: { client: { select: { id: true, business_name: true } }, subscription: { select: { plan_name: true, expiry_date: true } } },
         });
         if (license) {
@@ -59,11 +62,12 @@ function setupWebSocket(io) {
       }
 
       const ip = socket.handshake.address;
-      sm.registerDevice(deviceId, socket.id, { ...licenseInfo, ip });
+      sm.registerDevice(deviceId, socket.id, { ...licenseInfo, ip, licenseKey });
 
       // Broadcast to admin panel
       sm.broadcast('device:connected', {
         deviceId,
+        licenseKey,
         online: true,
         connectedAt: new Date().toISOString(),
         ip,

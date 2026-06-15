@@ -44,7 +44,33 @@ async function findAll(query) {
     prisma.license.count({ where }),
   ]);
 
-  return paginatedResponse(licenses, total, page, limit);
+  // Attach per-license device counts
+  const keys = licenses.map((l) => l.license_key);
+  const deviceRows = keys.length
+    ? await prisma.licenseDevice.findMany({ where: { license_key: { in: keys } } })
+    : [];
+  const countByKey = deviceRows.reduce((acc, d) => {
+    acc[d.license_key] = (acc[d.license_key] || 0) + 1;
+    return acc;
+  }, {});
+
+  const sm = getSocketManager();
+  const onlineMetas = sm ? sm.getConnectedDevicesMeta() : [];
+  const onlineDeviceIds   = new Set(onlineMetas.map((d) => d.deviceId));
+  const onlineLicenseKeys = new Set(onlineMetas.map((d) => d.licenseKey).filter(Boolean));
+  const onlineByKey = deviceRows.reduce((acc, d) => {
+    if (onlineDeviceIds.has(d.device_id) || onlineLicenseKeys.has(d.license_key))
+      acc[d.license_key] = (acc[d.license_key] || 0) + 1;
+    return acc;
+  }, {});
+
+  const enriched = licenses.map((l) => ({
+    ...l,
+    device_count: countByKey[l.license_key] || 0,
+    online_devices: onlineByKey[l.license_key] || 0,
+  }));
+
+  return paginatedResponse(enriched, total, page, limit);
 }
 
 async function findOne(id) {

@@ -174,6 +174,17 @@ model AuditLog {
   admin AdminUser? @relation(fields: [admin_id], references: [id])
 }
 
+model LicenseDevice {
+  id           String   @id @default(uuid())
+  license_key  String
+  device_id    String
+  platform     String?
+  last_seen    DateTime @default(now())
+  created_at   DateTime @default(now())
+
+  @@unique([license_key, device_id])
+}
+
 model PosSalesReport {
   id           String   @id
   license_key  String
@@ -184,4 +195,19 @@ model PosSalesReport {
   items_sold   Int      @default(0)
   payload      String?
   created_at   DateTime @default(now())
+}
+
+model PosData {
+  license_key     String   @id
+  products        String?
+  sales           String?
+  credits         String?
+  suppliers       String?
+  expenses        String?
+  stock_log       String?
+  quotations      String?
+  customers       String?
+  purchase_orders String?
+  shifts          String?
+  updated_at      DateTime @updatedAt
 }

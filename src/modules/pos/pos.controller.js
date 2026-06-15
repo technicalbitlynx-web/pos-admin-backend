@@ -2,6 +2,13 @@ const prisma = require('../../config/database');
 const { successResponse, errorResponse } = require('../../utils/helpers');
 const { hashFingerprint } = require('../../utils/helpers');
 
+async function requireActiveLicense(license_key) {
+  if (!license_key) { const e = new Error('license_key is required'); e.statusCode = 400; throw e; }
+  const lic = await prisma.license.findUnique({ where: { license_key } });
+  if (!lic || lic.status !== 'ACTIVE') { const e = new Error('Invalid or inactive license'); e.statusCode = 403; throw e; }
+  return lic;
+}
+
 async function validateLicense(req, res) {
   try {
     const { license_key, device_id, fingerprint } = req.body;
@@ -14,10 +21,6 @@ async function validateLicense(req, res) {
 
     if (!license) return successResponse(res, { data: { valid: false, status: 'not_found', message: 'License key not found' } });
 
-    if (license.device_id && device_id && license.device_id !== device_id) {
-      return successResponse(res, { data: { valid: false, status: 'device_mismatch', message: 'License bound to a different device' } });
-    }
-
     if (license.status === 'SUSPENDED') {
       return successResponse(res, { data: { valid: false, status: 'suspended', message: 'License suspended' } });
     }
@@ -29,7 +32,7 @@ async function validateLicense(req, res) {
       return successResponse(res, { data: { valid: false, status: 'expired', message: 'License has expired', expiry_date: license.expiry_date } });
     }
 
-    // Auto-activate PENDING license on first POS use
+    // Auto-activate PENDING license on first POS use; record the first device
     if (license.status === 'PENDING') {
       const fingerprintHash = fingerprint ? hashFingerprint(fingerprint) : null;
       await prisma.license.update({
@@ -43,14 +46,23 @@ async function validateLicense(req, res) {
         },
       });
     } else if (!license.device_id && device_id) {
-      // Bind device on first use (ACTIVE but unbound)
       const fingerprintHash = fingerprint ? hashFingerprint(fingerprint) : null;
       await prisma.license.update({
         where: { id: license.id },
         data: { device_id, device_fingerprint: fingerprintHash, activation_date: new Date(), last_check: new Date() },
       });
-    } else if (license.device_id) {
+    } else {
       await prisma.license.update({ where: { id: license.id }, data: { last_check: new Date() } });
+    }
+
+    // Track every device that validates this license (multi-device support)
+    if (device_id) {
+      const platform = req.headers['user-agent']?.toLowerCase().includes('android') ? 'android' : 'desktop';
+      await prisma.licenseDevice.upsert({
+        where: { license_key_device_id: { license_key, device_id } },
+        update: { last_seen: new Date(), platform },
+        create: { license_key, device_id, platform, last_seen: new Date() },
+      });
     }
 
     return successResponse(res, {
@@ -147,33 +159,77 @@ async function getDevices(req, res) {
     const { getSocketManager } = require('../../websocket/socketManager');
     const sm = getSocketManager();
     const onlineMetas = sm ? sm.getConnectedDevicesMeta() : [];
-    const onlineMap = new Map(onlineMetas.map((d) => [d.deviceId, d]));
+    const onlineDeviceIds   = new Set(onlineMetas.map((d) => d.deviceId));
+    const onlineLicenseKeys = new Set(onlineMetas.map((d) => d.licenseKey).filter(Boolean));
+    const metaByDeviceId    = new Map(onlineMetas.map((d) => [d.deviceId, d]));
+    const metaByLicenseKey  = new Map(onlineMetas.filter((d) => d.licenseKey).map((d) => [d.licenseKey, d]));
 
+    // Load all licenses for lookup
     const licenses = await prisma.license.findMany({
-      where: { status: 'ACTIVE' },
       include: {
         client: { select: { business_name: true } },
         subscription: { select: { plan_name: true, expiry_date: true } },
       },
-      orderBy: { activation_date: 'desc' },
+    });
+    const licByKey = new Map(licenses.map((l) => [l.license_key, l]));
+
+    // Load every registered device (one row per unique device+license)
+    const allDeviceRows = await prisma.licenseDevice.findMany({
+      orderBy: { last_seen: 'desc' },
     });
 
-    const devices = licenses.map((lic) => {
-      const live = onlineMap.get(lic.device_id) || {};
+    const entries = allDeviceRows.map((d) => {
+      const lic    = licByKey.get(d.license_key);
+      const isOnline = onlineDeviceIds.has(d.device_id) || onlineLicenseKeys.has(d.license_key);
+      const live   = metaByDeviceId.get(d.device_id) || metaByLicenseKey.get(d.license_key) || {};
+      const { socketId: _s, deviceId: _d, licenseKey: _lk, ...liveMeta } = live;
       return {
-        deviceId: lic.device_id,
-        licenseKey: lic.license_key,
-        licenseId: lic.id,
-        businessName: live.businessName || lic.client?.business_name || null,
-        planName: live.planName || lic.subscription?.plan_name || null,
-        expiryDate: lic.expiry_date || lic.subscription?.expiry_date || null,
-        activationDate: lic.activation_date,
-        online: onlineMap.has(lic.device_id),
-        ...live,
+        deviceId:       d.device_id,
+        licenseKey:     d.license_key,
+        licenseId:      lic?.id || null,
+        platform:       d.platform || 'desktop',
+        lastSeen:       d.last_seen,
+        businessName:   lic?.client?.business_name || null,
+        planName:       lic?.subscription?.plan_name || null,
+        expiryDate:     lic?.expiry_date || lic?.subscription?.expiry_date || null,
+        activationDate: lic?.activation_date || null,
+        licenseStatus:  lic?.status || null,
+        online:         isOnline,
+        ...liveMeta,
       };
     });
 
-    return successResponse(res, { data: devices });
+    // Include licenses with a device_id but no LicenseDevice record yet (legacy/first-run)
+    const knownDeviceIds = new Set(allDeviceRows.map((d) => d.device_id));
+    for (const lic of licenses) {
+      if (lic.device_id && !knownDeviceIds.has(lic.device_id)) {
+        const isOnline = onlineDeviceIds.has(lic.device_id) || onlineLicenseKeys.has(lic.license_key);
+        const live = metaByDeviceId.get(lic.device_id) || metaByLicenseKey.get(lic.license_key) || {};
+        const { socketId: _s, deviceId: _d, licenseKey: _lk, ...liveMeta } = live;
+        entries.push({
+          deviceId:       lic.device_id,
+          licenseKey:     lic.license_key,
+          licenseId:      lic.id,
+          platform:       'desktop',
+          lastSeen:       lic.last_check || lic.activation_date,
+          businessName:   lic.client?.business_name || null,
+          planName:       lic.subscription?.plan_name || null,
+          expiryDate:     lic.expiry_date || lic.subscription?.expiry_date || null,
+          activationDate: lic.activation_date,
+          licenseStatus:  lic.status,
+          online:         isOnline,
+          ...liveMeta,
+        });
+      }
+    }
+
+    // Sort: online first, then by lastSeen desc
+    entries.sort((a, b) => {
+      if (a.online !== b.online) return a.online ? -1 : 1;
+      return new Date(b.lastSeen || 0) - new Date(a.lastSeen || 0);
+    });
+
+    return successResponse(res, { data: entries });
   } catch (err) {
     return errorResponse(res, err.message || 'Error', 500);
   }
@@ -194,4 +250,55 @@ async function sendDeviceCommand(req, res) {
   }
 }
 
-module.exports = { validateLicense, syncSales, getStatus, getDevices, sendDeviceCommand };
+async function syncAllData(req, res) {
+  try {
+    const { license_key, products, sales, credits, suppliers, expenses, stock_log, quotations, customers, purchase_orders, shifts } = req.body;
+    await requireActiveLicense(license_key);
+    const data = {};
+    if (products        !== undefined) data.products        = JSON.stringify(products);
+    if (sales           !== undefined) data.sales           = JSON.stringify(sales);
+    if (credits         !== undefined) data.credits         = JSON.stringify(credits);
+    if (suppliers       !== undefined) data.suppliers       = JSON.stringify(suppliers);
+    if (expenses        !== undefined) data.expenses        = JSON.stringify(expenses);
+    if (stock_log       !== undefined) data.stock_log       = JSON.stringify(stock_log);
+    if (quotations      !== undefined) data.quotations      = JSON.stringify(quotations);
+    if (customers       !== undefined) data.customers       = JSON.stringify(customers);
+    if (purchase_orders !== undefined) data.purchase_orders = JSON.stringify(purchase_orders);
+    if (shifts          !== undefined) data.shifts          = JSON.stringify(shifts);
+    await prisma.posData.upsert({
+      where:  { license_key },
+      update: data,
+      create: { license_key, ...data },
+    });
+    return successResponse(res, { data: { synced: true } });
+  } catch (err) {
+    return errorResponse(res, err.message || 'Sync error', err.statusCode || 500);
+  }
+}
+
+async function loadAllData(req, res) {
+  try {
+    const { license_key } = req.query;
+    await requireActiveLicense(license_key);
+    const row = await prisma.posData.findUnique({ where: { license_key } });
+    if (!row) return successResponse(res, { data: null });
+    const p = (s) => { if (!s) return null; try { return JSON.parse(s); } catch { return null; } };
+    return successResponse(res, { data: {
+      products:        p(row.products),
+      sales:           p(row.sales),
+      credits:         p(row.credits),
+      suppliers:       p(row.suppliers),
+      expenses:        p(row.expenses),
+      stock_log:       p(row.stock_log),
+      quotations:      p(row.quotations),
+      customers:       p(row.customers),
+      purchase_orders: p(row.purchase_orders),
+      shifts:          p(row.shifts),
+      updated_at:      row.updated_at,
+    }});
+  } catch (err) {
+    return errorResponse(res, err.message || 'Load error', err.statusCode || 500);
+  }
+}
+
+module.exports = { validateLicense, syncSales, getStatus, getDevices, sendDeviceCommand, syncAllData, loadAllData };

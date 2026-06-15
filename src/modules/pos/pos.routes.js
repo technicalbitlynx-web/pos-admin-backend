@@ -7,6 +7,8 @@ const { authenticate } = require('../../middleware/auth');
 router.post('/validate-license', posLimiter, controller.validateLicense);
 router.post('/sync-sales', posLimiter, controller.syncSales);
 router.get('/status', posLimiter, controller.getStatus);
+router.post('/sync-all', posLimiter, controller.syncAllData);
+router.get('/load-all',  posLimiter, controller.loadAllData);
 
 // Admin-only: device management
 router.get('/devices', authenticate, controller.getDevices);

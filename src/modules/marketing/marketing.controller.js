@@ -3,7 +3,7 @@ const prisma = require('../../config/database');
 const { successResponse, errorResponse, paginate, paginatedResponse } = require('../../utils/helpers');
 
 // POST /api/v1/marketing/register  (PUBLIC)
-async function register(req, res) {
+async function register(req, res, next) {
   try {
     const { name, email, phone, password } = req.body;
     if (!name || !email || !password) return errorResponse(res, 'name, email and password are required', 400);
@@ -19,12 +19,13 @@ async function register(req, res) {
     const { password: _, ...safe } = officer;
     return successResponse(res, { data: safe }, 201, 'Officer registered successfully');
   } catch (err) {
-    return errorResponse(res, err.message || 'Registration error', err.statusCode || 500);
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
   }
 }
 
 // GET /api/v1/marketing/officers  (admin)
-async function getOfficers(req, res) {
+async function getOfficers(req, res, next) {
   try {
     const { page, limit, skip } = paginate(req.query);
 
@@ -64,12 +65,13 @@ async function getOfficers(req, res) {
 
     return successResponse(res, paginatedResponse(enriched, total, page, limit));
   } catch (err) {
-    return errorResponse(res, err.message || 'Error', 500);
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
   }
 }
 
 // GET /api/v1/marketing/my-stats  (SALES_MANAGER own)
-async function myStats(req, res) {
+async function myStats(req, res, next) {
   try {
     const officerId = req.admin.id;
     const officer = await prisma.adminUser.findUnique({
@@ -118,12 +120,13 @@ async function myStats(req, res) {
       },
     });
   } catch (err) {
-    return errorResponse(res, err.message || 'Error', 500);
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
   }
 }
 
 // GET /api/v1/marketing/my-clients  (SALES_MANAGER own)
-async function myClients(req, res) {
+async function myClients(req, res, next) {
   try {
     const officerId = req.admin.id;
     const { page, limit, skip } = paginate(req.query);
@@ -145,12 +148,13 @@ async function myClients(req, res) {
 
     return successResponse(res, paginatedResponse(clients, total, page, limit));
   } catch (err) {
-    return errorResponse(res, err.message || 'Error', 500);
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
   }
 }
 
 // PATCH /api/v1/marketing/officers/:id/commission  (SUPER_ADMIN)
-async function updateCommission(req, res) {
+async function updateCommission(req, res, next) {
   try {
     const { id } = req.params;
     const { commission_rate } = req.body;
@@ -164,7 +168,8 @@ async function updateCommission(req, res) {
     });
     return successResponse(res, { data: officer }, 200, 'Commission rate updated');
   } catch (err) {
-    return errorResponse(res, err.message || 'Error', err.statusCode || 500);
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
   }
 }
 

@@ -34,7 +34,7 @@ services:
   - type: cron
     name: pos-keep-alive
     runtime: node
-    schedule: "*/14 * * * *"
+    schedule: "*/10 * * * *"
     buildCommand: echo ok
     startCommand: node -e "require('https').get('https://pos-admin-backend.onrender.com/health', r => process.exit(0)).on('error', () => process.exit(0))"
     plan: free

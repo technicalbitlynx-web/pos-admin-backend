@@ -219,3 +219,18 @@ model PosData {
   shifts          String?
   updated_at      DateTime @updatedAt
 }
+
+model PosOperator {
+  id          String   @id @default(uuid())
+  license_key String
+  name        String
+  username    String
+  pin_hash    String
+  role        String   @default("teller")
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@unique([license_key, username])
+  @@index([license_key])
+}

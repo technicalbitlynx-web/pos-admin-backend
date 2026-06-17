@@ -3,7 +3,7 @@ const { errorResponse } = require('../utils/helpers');
 const ROLE_PERMISSIONS = {
   SUPER_ADMIN: ['*'],
   FINANCE_OFFICER: ['payments:*', 'invoices:*', 'reports:read', 'clients:read'],
-  SUPPORT_AGENT: ['tickets:*', 'clients:read'],
+  SUPPORT_AGENT: ['tickets:*', 'clients:read', 'operators:read'],
   SALES_MANAGER: ['clients:*', 'subscriptions:*', 'licenses:create', 'payments:create', 'reports:read'],
 };
 

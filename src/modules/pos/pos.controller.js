@@ -1,3 +1,4 @@
+const bcrypt = require('bcryptjs');
 const prisma = require('../../config/database');
 const { successResponse, errorResponse } = require('../../utils/helpers');
 const { hashFingerprint } = require('../../utils/helpers');
@@ -280,25 +281,133 @@ async function loadAllData(req, res) {
   try {
     const { license_key } = req.query;
     await requireActiveLicense(license_key);
-    const row = await prisma.posData.findUnique({ where: { license_key } });
-    if (!row) return successResponse(res, { data: null });
+
+    const [row, operators] = await Promise.all([
+      prisma.posData.findUnique({ where: { license_key } }),
+      prisma.posOperator.findMany({
+        where: { license_key, is_active: true },
+        select: { id: true, name: true, username: true, role: true },
+      }),
+    ]);
+
     const p = (s) => { if (!s) return null; try { return JSON.parse(s); } catch { return null; } };
     return successResponse(res, { data: {
-      products:        p(row.products),
-      sales:           p(row.sales),
-      credits:         p(row.credits),
-      suppliers:       p(row.suppliers),
-      expenses:        p(row.expenses),
-      stock_log:       p(row.stock_log),
-      quotations:      p(row.quotations),
-      customers:       p(row.customers),
-      purchase_orders: p(row.purchase_orders),
-      shifts:          p(row.shifts),
-      updated_at:      row.updated_at,
+      products:        row ? p(row.products)        : null,
+      sales:           row ? p(row.sales)           : null,
+      credits:         row ? p(row.credits)         : null,
+      suppliers:       row ? p(row.suppliers)       : null,
+      expenses:        row ? p(row.expenses)        : null,
+      stock_log:       row ? p(row.stock_log)       : null,
+      quotations:      row ? p(row.quotations)      : null,
+      customers:       row ? p(row.customers)       : null,
+      purchase_orders: row ? p(row.purchase_orders) : null,
+      shifts:          row ? p(row.shifts)          : null,
+      updated_at:      row?.updated_at || null,
+      operators,
     }});
   } catch (err) {
     return errorResponse(res, err.message || 'Load error', err.statusCode || 500);
   }
 }
 
-module.exports = { validateLicense, syncSales, getStatus, getDevices, sendDeviceCommand, syncAllData, loadAllData };
+// ─── POS Operator CRUD ───────────────────────────────────────────────────────
+
+async function verifyOperatorPin(req, res) {
+  try {
+    const { license_key, username, pin } = req.body;
+    if (!license_key || !username || !pin) {
+      return errorResponse(res, 'license_key, username and pin are required', 400);
+    }
+    await requireActiveLicense(license_key);
+    const operator = await prisma.posOperator.findFirst({
+      where: { license_key, username, is_active: true },
+    });
+    if (!operator) return successResponse(res, { data: { valid: false } });
+    const match = await bcrypt.compare(String(pin), operator.pin_hash);
+    if (!match) return successResponse(res, { data: { valid: false } });
+    return successResponse(res, {
+      data: { valid: true, operator: { id: operator.id, name: operator.name, username: operator.username, role: operator.role } },
+    });
+  } catch (err) {
+    return errorResponse(res, err.message || 'Error', err.statusCode || 500);
+  }
+}
+
+async function listOperators(req, res, next) {
+  try {
+    const { license_key } = req.query;
+    if (!license_key) return errorResponse(res, 'license_key is required', 400);
+    const operators = await prisma.posOperator.findMany({
+      where: { license_key },
+      select: { id: true, name: true, username: true, role: true, is_active: true, created_at: true, updated_at: true },
+      orderBy: { created_at: 'asc' },
+    });
+    return successResponse(res, { data: operators });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function createOperator(req, res, next) {
+  try {
+    const { license_key, name, username, pin, role } = req.body;
+    if (!license_key || !name || !username || !pin) {
+      return errorResponse(res, 'license_key, name, username and pin are required', 400);
+    }
+    if (!/^\d{4,6}$/.test(String(pin))) {
+      return errorResponse(res, 'PIN must be 4–6 digits', 400);
+    }
+    const lic = await prisma.license.findUnique({ where: { license_key } });
+    if (!lic) return errorResponse(res, 'License not found', 404);
+
+    const pin_hash = await bcrypt.hash(String(pin), 10);
+    const operator = await prisma.posOperator.create({
+      data: { license_key, name, username, pin_hash, role: role || 'teller' },
+      select: { id: true, name: true, username: true, role: true, is_active: true, created_at: true },
+    });
+    return successResponse(res, { data: operator }, 201, 'Operator created');
+  } catch (err) {
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
+  }
+}
+
+async function updateOperator(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { name, username, pin, role, is_active } = req.body;
+    const data = {};
+    if (name      !== undefined) data.name      = name;
+    if (username  !== undefined) data.username  = username;
+    if (role      !== undefined) data.role      = role;
+    if (is_active !== undefined) data.is_active = is_active;
+    if (pin !== undefined) {
+      if (!/^\d{4,6}$/.test(String(pin))) return errorResponse(res, 'PIN must be 4–6 digits', 400);
+      data.pin_hash = await bcrypt.hash(String(pin), 10);
+    }
+    const operator = await prisma.posOperator.update({
+      where: { id },
+      data,
+      select: { id: true, name: true, username: true, role: true, is_active: true, updated_at: true },
+    });
+    return successResponse(res, { data: operator }, 200, 'Operator updated');
+  } catch (err) {
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
+  }
+}
+
+async function removeOperator(req, res, next) {
+  try {
+    await prisma.posOperator.delete({ where: { id: req.params.id } });
+    return successResponse(res, {}, 200, 'Operator deleted');
+  } catch (err) {
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
+  }
+}
+
+module.exports = {
+  validateLicense, syncSales, getStatus, getDevices, sendDeviceCommand, syncAllData, loadAllData,
+  verifyOperatorPin, listOperators, createOperator, updateOperator, removeOperator,
+};

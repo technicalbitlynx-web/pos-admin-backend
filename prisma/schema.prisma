@@ -183,14 +183,34 @@ model AuditLog {
 }
 
 model LicenseDevice {
-  id           String   @id @default(uuid())
-  license_key  String
-  device_id    String
-  platform     String?
-  last_seen    DateTime @default(now())
-  created_at   DateTime @default(now())
+  id            String   @id @default(uuid())
+  license_key   String
+  device_id     String
+  device_type   String   @default("pos")   // 'manager' | 'pos'
+  device_name   String?
+  platform      String?                    // 'desktop' | 'mobile'
+  registered_by String?
+  is_active     Boolean  @default(true)
+  last_seen     DateTime @default(now())
+  created_at    DateTime @default(now())
 
   @@unique([license_key, device_id])
+}
+
+model PosDeviceAuditLog {
+  id          String   @id @default(uuid())
+  license_key String
+  device_id   String
+  device_type String?
+  user_id     String?
+  action      String   // 'register' | 'reassign' | 'deregister' | 'login_denied' | 'limit_exceeded'
+  result      String   @default("success") // 'success' | 'denied' | 'error'
+  details     String?
+  ip_address  String?
+  created_at  DateTime @default(now())
+
+  @@index([license_key])
+  @@index([device_id])
 }
 
 model PosSalesReport {

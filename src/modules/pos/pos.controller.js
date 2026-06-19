@@ -1,7 +1,71 @@
 const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 const prisma = require('../../config/database');
 const { successResponse, errorResponse } = require('../../utils/helpers');
 const { hashFingerprint } = require('../../utils/helpers');
+
+// ─── Device Management Constants ─────────────────────────────────────────────
+
+const DEVICE_LIMITS = {
+  basic:        { manager_desktop: 1, manager_mobile: 1 },
+  intermediate: { manager_desktop: 2, manager_mobile: 2 },
+  professional: { manager_desktop: 5, manager_mobile: 5 },
+  enterprise:   { manager_desktop: null, manager_mobile: null }, // null = unlimited
+};
+
+function normalizePlatform(platform) {
+  if (!platform) return 'desktop';
+  const p = platform.toLowerCase();
+  if (p === 'mobile' || p === 'android' || p === 'ios') return 'mobile';
+  return 'desktop';
+}
+
+function getPlanLimits(planName) {
+  const key = (planName || 'basic').toLowerCase().replace(/[\s-]+/g, '_');
+  return DEVICE_LIMITS[key] || DEVICE_LIMITS.basic;
+}
+
+async function getManagerDeviceCount(license_key, platform, excludeDeviceId = null) {
+  const where = {
+    license_key,
+    device_type: 'manager',
+    is_active: true,
+    platform: normalizePlatform(platform),
+  };
+  if (excludeDeviceId) where.device_id = { not: excludeDeviceId };
+  return prisma.licenseDevice.count({ where });
+}
+
+async function verifyManagerPin(license_key, username, pin) {
+  if (!username || !pin) return false;
+  const operator = await prisma.posOperator.findFirst({
+    where: { license_key, username, is_active: true, role: 'manager' },
+  });
+  if (!operator) return false;
+  return bcrypt.compare(String(pin), operator.pin_hash);
+}
+
+async function logDeviceAudit({ license_key, device_id, device_type, user_id, action, result, details, ip_address }) {
+  try {
+    await prisma.posDeviceAuditLog.create({
+      data: {
+        id: uuidv4(),
+        license_key,
+        device_id,
+        device_type: device_type || null,
+        user_id: user_id || null,
+        action,
+        result: result || 'success',
+        details: details ? JSON.stringify(details) : null,
+        ip_address: ip_address || null,
+      },
+    });
+  } catch (e) {
+    console.error('Device audit log failed:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function requireActiveLicense(license_key) {
   if (!license_key) { const e = new Error('license_key is required'); e.statusCode = 400; throw e; }
@@ -66,6 +130,32 @@ async function validateLicense(req, res) {
       });
     }
 
+    // Determine device registration status and subscription limits
+    let device_info = { registered: false, device_type: null };
+    let device_limits = null;
+
+    if (device_id) {
+      const deviceRow = await prisma.licenseDevice.findUnique({
+        where: { license_key_device_id: { license_key, device_id } },
+      });
+      if (deviceRow && deviceRow.is_active) {
+        device_info = { registered: true, device_type: deviceRow.device_type };
+      }
+    }
+
+    const planName = license.subscription?.plan_name || 'basic';
+    const limits = getPlanLimits(planName);
+    const [usedDesktop, usedMobile] = await Promise.all([
+      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'desktop' } }),
+      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'mobile' } }),
+    ]);
+    device_limits = {
+      manager_desktop: limits.manager_desktop,
+      manager_mobile: limits.manager_mobile,
+      used_manager_desktops: usedDesktop,
+      used_manager_mobiles: usedMobile,
+    };
+
     return successResponse(res, {
       data: {
         valid: true,
@@ -75,6 +165,8 @@ async function validateLicense(req, res) {
         expiry_date: license.expiry_date,
         plan_name: license.subscription?.plan_name || null,
         business_name: license.client?.business_name || null,
+        device_info,
+        device_limits,
       },
     });
   } catch (err) {
@@ -407,7 +499,273 @@ async function removeOperator(req, res, next) {
   }
 }
 
+// ─── POS Device Registration & Management ────────────────────────────────────
+
+async function registerDevice(req, res) {
+  try {
+    const { license_key, device_id, device_type, platform, device_name, operator_username } = req.body;
+    if (!license_key || !device_id || !device_type) {
+      return errorResponse(res, 'license_key, device_id and device_type are required', 400);
+    }
+    if (!['manager', 'pos'].includes(device_type)) {
+      return errorResponse(res, 'device_type must be "manager" or "pos"', 400);
+    }
+
+    const license = await prisma.license.findUnique({
+      where: { license_key },
+      include: { subscription: { select: { plan_name: true } } },
+    });
+    if (!license || license.status !== 'ACTIVE') {
+      return errorResponse(res, 'Invalid or inactive license', 403);
+    }
+
+    const normalizedPlatform = normalizePlatform(platform);
+
+    if (device_type === 'manager') {
+      const limits = getPlanLimits(license.subscription?.plan_name);
+      const limitKey = normalizedPlatform === 'mobile' ? 'manager_mobile' : 'manager_desktop';
+      const limit = limits[limitKey];
+
+      if (limit !== null) {
+        // Only count against the limit if this is a new manager device (not a re-registration)
+        const existing = await prisma.licenseDevice.findUnique({
+          where: { license_key_device_id: { license_key, device_id } },
+        });
+        const isNewManagerDevice = !existing || existing.device_type !== 'manager' || !existing.is_active;
+        if (isNewManagerDevice) {
+          const used = await getManagerDeviceCount(license_key, normalizedPlatform);
+          if (used >= limit) {
+            await logDeviceAudit({
+              license_key, device_id, device_type,
+              user_id: operator_username || null,
+              action: 'register', result: 'denied',
+              details: { reason: 'limit_exceeded', limit, used },
+              ip_address: req.ip,
+            });
+            return errorResponse(
+              res,
+              `Manager ${normalizedPlatform} device limit reached (${limit}/${limit}). Deregister an existing device or upgrade your plan.`,
+              403
+            );
+          }
+        }
+      }
+    }
+
+    const row = await prisma.licenseDevice.upsert({
+      where: { license_key_device_id: { license_key, device_id } },
+      update: {
+        device_type,
+        device_name: device_name || null,
+        registered_by: operator_username || null,
+        platform: normalizedPlatform,
+        is_active: true,
+        last_seen: new Date(),
+      },
+      create: {
+        id: uuidv4(),
+        license_key,
+        device_id,
+        device_type,
+        device_name: device_name || null,
+        platform: normalizedPlatform,
+        registered_by: operator_username || null,
+        is_active: true,
+      },
+    });
+
+    await logDeviceAudit({
+      license_key, device_id, device_type,
+      user_id: operator_username || null,
+      action: 'register', result: 'success',
+      ip_address: req.ip,
+    });
+
+    return successResponse(
+      res,
+      { data: { registered: true, device_type: row.device_type, device_id, platform: normalizedPlatform } },
+      201,
+      'Device registered'
+    );
+  } catch (err) {
+    return errorResponse(res, err.message || 'Registration error', err.statusCode || 500);
+  }
+}
+
+async function listPosDevices(req, res) {
+  try {
+    const { license_key } = req.query;
+    if (!license_key) return errorResponse(res, 'license_key is required', 400);
+
+    const license = await prisma.license.findUnique({
+      where: { license_key },
+      include: { subscription: { select: { plan_name: true } } },
+    });
+    if (!license || license.status !== 'ACTIVE') {
+      return errorResponse(res, 'Invalid or inactive license', 403);
+    }
+
+    const devices = await prisma.licenseDevice.findMany({
+      where: { license_key, is_active: true },
+      orderBy: { last_seen: 'desc' },
+      select: {
+        device_id: true,
+        device_type: true,
+        device_name: true,
+        platform: true,
+        registered_by: true,
+        last_seen: true,
+        created_at: true,
+      },
+    });
+
+    const limits = getPlanLimits(license.subscription?.plan_name);
+    const [usedDesktop, usedMobile] = await Promise.all([
+      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'desktop' } }),
+      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'mobile' } }),
+    ]);
+
+    return successResponse(res, {
+      data: {
+        devices,
+        device_limits: {
+          manager_desktop: limits.manager_desktop,
+          manager_mobile: limits.manager_mobile,
+          used_manager_desktops: usedDesktop,
+          used_manager_mobiles: usedMobile,
+          plan_name: license.subscription?.plan_name || 'Basic',
+        },
+      },
+    });
+  } catch (err) {
+    return errorResponse(res, err.message || 'Error', 500);
+  }
+}
+
+async function reassignDevice(req, res) {
+  try {
+    const { deviceId } = req.params;
+    const { license_key, new_device_type, manager_username, manager_pin } = req.body;
+
+    if (!license_key || !new_device_type || !manager_username || !manager_pin) {
+      return errorResponse(res, 'license_key, new_device_type, manager_username and manager_pin are required', 400);
+    }
+    if (!['manager', 'pos'].includes(new_device_type)) {
+      return errorResponse(res, 'new_device_type must be "manager" or "pos"', 400);
+    }
+
+    const authorized = await verifyManagerPin(license_key, manager_username, manager_pin);
+    if (!authorized) {
+      await logDeviceAudit({
+        license_key, device_id: deviceId, device_type: new_device_type,
+        user_id: manager_username, action: 'reassign', result: 'denied',
+        details: { reason: 'invalid_pin' }, ip_address: req.ip,
+      });
+      return errorResponse(res, 'Manager PIN verification failed', 403);
+    }
+
+    const existing = await prisma.licenseDevice.findFirst({
+      where: { license_key, device_id: deviceId, is_active: true },
+    });
+    if (!existing) return errorResponse(res, 'Device not found or not active', 404);
+
+    if (new_device_type === 'manager' && existing.device_type !== 'manager') {
+      const license = await prisma.license.findUnique({
+        where: { license_key },
+        include: { subscription: { select: { plan_name: true } } },
+      });
+      const limits = getPlanLimits(license?.subscription?.plan_name);
+      const normalizedPlatform = normalizePlatform(existing.platform);
+      const limit = normalizedPlatform === 'mobile' ? limits.manager_mobile : limits.manager_desktop;
+
+      if (limit !== null) {
+        const used = await getManagerDeviceCount(license_key, normalizedPlatform, deviceId);
+        if (used >= limit) {
+          await logDeviceAudit({
+            license_key, device_id: deviceId, device_type: new_device_type,
+            user_id: manager_username, action: 'reassign', result: 'denied',
+            details: { reason: 'limit_exceeded', limit, used }, ip_address: req.ip,
+          });
+          return errorResponse(res, `Manager ${normalizedPlatform} device limit reached (${limit})`, 403);
+        }
+      }
+    }
+
+    await prisma.licenseDevice.updateMany({
+      where: { license_key, device_id: deviceId },
+      data: { device_type: new_device_type, registered_by: manager_username },
+    });
+
+    await logDeviceAudit({
+      license_key, device_id: deviceId, device_type: new_device_type,
+      user_id: manager_username, action: 'reassign', result: 'success',
+      details: { old_type: existing.device_type, new_type: new_device_type },
+      ip_address: req.ip,
+    });
+
+    try {
+      const { getSocketManager } = require('../../websocket/socketManager');
+      const sm = getSocketManager();
+      if (sm) sm.notifyDevice(deviceId, 'pos:refresh', { reason: 'device_reassigned' });
+    } catch {}
+
+    return successResponse(res, { data: { reassigned: true, device_id: deviceId, new_device_type } }, 200, 'Device reassigned');
+  } catch (err) {
+    return errorResponse(res, err.message || 'Error', 500);
+  }
+}
+
+async function deregisterDevice(req, res) {
+  try {
+    const { deviceId } = req.params;
+    const { license_key, manager_username, manager_pin } = req.body;
+
+    if (!license_key || !manager_username || !manager_pin) {
+      return errorResponse(res, 'license_key, manager_username and manager_pin are required', 400);
+    }
+
+    const authorized = await verifyManagerPin(license_key, manager_username, manager_pin);
+    if (!authorized) {
+      await logDeviceAudit({
+        license_key, device_id: deviceId,
+        user_id: manager_username, action: 'deregister', result: 'denied',
+        details: { reason: 'invalid_pin' }, ip_address: req.ip,
+      });
+      return errorResponse(res, 'Manager PIN verification failed', 403);
+    }
+
+    const existing = await prisma.licenseDevice.findFirst({
+      where: { license_key, device_id: deviceId, is_active: true },
+    });
+    if (!existing) return errorResponse(res, 'Device not found or already deregistered', 404);
+
+    await prisma.licenseDevice.updateMany({
+      where: { license_key, device_id: deviceId },
+      data: { is_active: false },
+    });
+
+    await logDeviceAudit({
+      license_key, device_id: deviceId, device_type: existing.device_type,
+      user_id: manager_username, action: 'deregister', result: 'success',
+      ip_address: req.ip,
+    });
+
+    try {
+      const { getSocketManager } = require('../../websocket/socketManager');
+      const sm = getSocketManager();
+      if (sm) sm.notifyDevice(deviceId, 'pos:refresh', { reason: 'device_deregistered' });
+    } catch {}
+
+    return successResponse(res, { data: { deregistered: true, device_id: deviceId } }, 200, 'Device deregistered');
+  } catch (err) {
+    return errorResponse(res, err.message || 'Error', 500);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = {
   validateLicense, syncSales, getStatus, getDevices, sendDeviceCommand, syncAllData, loadAllData,
   verifyOperatorPin, listOperators, createOperator, updateOperator, removeOperator,
+  registerDevice, listPosDevices, reassignDevice, deregisterDevice,
 };

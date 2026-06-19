@@ -20,8 +20,14 @@ router.post('/operators',     authenticate, authorize('operators:write'), contro
 router.patch('/operators/:id', authenticate, authorize('operators:write'), controller.updateOperator);
 router.delete('/operators/:id', authenticate, authorize('operators:write'), controller.removeOperator);
 
-// Admin-only: device management
+// Admin-only: full device overview + remote commands
 router.get('/devices', authenticate, controller.getDevices);
 router.post('/devices/:deviceId/command', authenticate, controller.sendDeviceCommand);
+
+// Public device management — authenticated via license_key (+ manager PIN for write ops)
+router.post('/devices/register',                posLimiter, controller.registerDevice);
+router.get('/devices/list',                     posLimiter, controller.listPosDevices);
+router.put('/devices/:deviceId/reassign',       posLimiter, controller.reassignDevice);
+router.delete('/devices/:deviceId/deregister',  posLimiter, controller.deregisterDevice);
 
 module.exports = router;

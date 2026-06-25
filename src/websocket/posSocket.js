@@ -109,15 +109,15 @@ function setupWebSocket(io) {
       socket.on('pos:data-push', async (payload) => {
         try {
           // Persist to cloud as the latest snapshot
-          const { license_key: lk, products, sales, credits, suppliers, expenses, stock_log, quotations } = payload;
+          const { license_key: lk, products, sales, credits, customers, suppliers, expenses, quotations } = payload;
           if (lk) {
             const blob = {};
             if (products)   blob.products   = JSON.stringify(products);
             if (sales)      blob.sales       = JSON.stringify(sales);
             if (credits)    blob.credits     = JSON.stringify(credits);
+            if (customers)  blob.customers   = JSON.stringify(customers);
             if (suppliers)  blob.suppliers   = JSON.stringify(suppliers);
             if (expenses)   blob.expenses    = JSON.stringify(expenses);
-            if (stock_log)  blob.stock_log   = JSON.stringify(stock_log);
             if (quotations) blob.quotations  = JSON.stringify(quotations);
             if (Object.keys(blob).length) {
               await prisma.posData.upsert({

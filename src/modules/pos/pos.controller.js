@@ -6,11 +6,16 @@ const { hashFingerprint } = require('../../utils/helpers');
 
 // ─── Device Management Constants ─────────────────────────────────────────────
 
+// Pricing tiers (KES/month):
+//   Starter      20,000 — 1 manager, 1 POS
+//   Standard     60,000 — 1 manager, 2 POS
+//   Professional 100,000 — 2 managers, 3 POS
+//   Enterprise   200,000 — 3 managers, 5 POS
 const DEVICE_LIMITS = {
-  basic:        { manager_desktop: 1, manager_mobile: 1 },
-  intermediate: { manager_desktop: 2, manager_mobile: 2 },
-  professional: { manager_desktop: 5, manager_mobile: 5 },
-  enterprise:   { manager_desktop: null, manager_mobile: null }, // null = unlimited
+  starter:      { manager: 1, pos: 1 },
+  standard:     { manager: 1, pos: 2 },
+  professional: { manager: 2, pos: 3 },
+  enterprise:   { manager: 3, pos: 5 },
 };
 
 function normalizePlatform(platform) {
@@ -21,17 +26,12 @@ function normalizePlatform(platform) {
 }
 
 function getPlanLimits(planName) {
-  const key = (planName || 'basic').toLowerCase().replace(/[\s-]+/g, '_');
-  return DEVICE_LIMITS[key] || DEVICE_LIMITS.basic;
+  const key = (planName || 'starter').toLowerCase().replace(/[\s\-]+/g, '_');
+  return DEVICE_LIMITS[key] || DEVICE_LIMITS.starter;
 }
 
-async function getManagerDeviceCount(license_key, platform, excludeDeviceId = null) {
-  const where = {
-    license_key,
-    device_type: 'manager',
-    is_active: true,
-    platform: normalizePlatform(platform),
-  };
+async function getDeviceCount(license_key, device_type, excludeDeviceId = null) {
+  const where = { license_key, device_type, is_active: true };
   if (excludeDeviceId) where.device_id = { not: excludeDeviceId };
   return prisma.licenseDevice.count({ where });
 }
@@ -145,17 +145,17 @@ async function validateLicense(req, res) {
       }
     }
 
-    const planName = license.subscription?.plan_name || 'basic';
+    const planName = license.subscription?.plan_name || 'starter';
     const limits = getPlanLimits(planName);
-    const [usedDesktop, usedMobile] = await Promise.all([
-      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'desktop' } }),
-      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'mobile' } }),
+    const [usedManagers, usedPos] = await Promise.all([
+      getDeviceCount(license_key, 'manager'),
+      getDeviceCount(license_key, 'pos'),
     ]);
     device_limits = {
-      manager_desktop: limits.manager_desktop,
-      manager_mobile: limits.manager_mobile,
-      used_manager_desktops: usedDesktop,
-      used_manager_mobiles: usedMobile,
+      manager_slots: limits.manager,
+      pos_slots: limits.pos,
+      used_managers: usedManagers,
+      used_pos: usedPos,
     };
 
     return successResponse(res, {
@@ -582,26 +582,37 @@ async function registerDevice(req, res) {
       }
 
       const limits = getPlanLimits(license.subscription?.plan_name);
-      const limitKey = normalizedPlatform === 'mobile' ? 'manager_mobile' : 'manager_desktop';
-      const limit = limits[limitKey];
-
-      if (limit !== null) {
-        const existing = await prisma.licenseDevice.findUnique({
-          where: { license_key_device_id: { license_key, device_id } },
-        });
-        const isNewManagerDevice = !existing || existing.device_type !== 'manager' || !existing.is_active;
-        if (isNewManagerDevice) {
-          const used = await getManagerDeviceCount(license_key, normalizedPlatform);
-          if (used >= limit) {
-            await logDeviceAudit({ license_key, device_id, device_type, user_id: manager_username || null, action: 'register', result: 'denied', details: { reason: 'limit_exceeded', limit, used }, ip_address: req.ip });
-            return errorResponse(res, `Manager ${normalizedPlatform} device limit reached (${limit}/${limit}). Deregister an existing device or upgrade your plan.`, 403);
-          }
+      const limit = limits.manager;
+      const existing = await prisma.licenseDevice.findUnique({
+        where: { license_key_device_id: { license_key, device_id } },
+      });
+      const isNewManagerDevice = !existing || existing.device_type !== 'manager' || !existing.is_active;
+      if (isNewManagerDevice) {
+        const used = await getDeviceCount(license_key, 'manager');
+        if (used >= limit) {
+          await logDeviceAudit({ license_key, device_id, device_type, user_id: manager_username || null, action: 'register', result: 'denied', details: { reason: 'limit_exceeded', limit, used }, ip_address: req.ip });
+          return errorResponse(res, `Manager device limit reached (${used}/${limit}). Deregister an existing device or upgrade your plan.`, 403);
         }
       }
     }
 
-    // ── POS registration: require a valid access code ─────────────────────────
+    // ── POS registration: check slot limit then require a valid access code ────
     if (device_type === 'pos') {
+      // Check POS slot limit first
+      const limits = getPlanLimits(license.subscription?.plan_name);
+      const posLimit = limits.pos;
+      const existingPosRow = await prisma.licenseDevice.findUnique({
+        where: { license_key_device_id: { license_key, device_id } },
+      });
+      const isNewPosDevice = !existingPosRow || existingPosRow.device_type !== 'pos' || !existingPosRow.is_active;
+      if (isNewPosDevice) {
+        const usedPos = await getDeviceCount(license_key, 'pos');
+        if (usedPos >= posLimit) {
+          await logDeviceAudit({ license_key, device_id, device_type, action: 'register', result: 'denied', details: { reason: 'limit_exceeded', limit: posLimit, used: usedPos }, ip_address: req.ip });
+          return errorResponse(res, `POS device limit reached (${usedPos}/${posLimit}). Deregister an existing device or upgrade your plan.`, 403);
+        }
+      }
+
       if (!access_code) {
         // Check if any credentials exist — if so, require one
         const credCount = await prisma.$queryRawUnsafe(
@@ -714,20 +725,20 @@ async function listPosDevices(req, res) {
     });
 
     const limits = getPlanLimits(license.subscription?.plan_name);
-    const [usedDesktop, usedMobile] = await Promise.all([
-      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'desktop' } }),
-      prisma.licenseDevice.count({ where: { license_key, device_type: 'manager', is_active: true, platform: 'mobile' } }),
+    const [usedManagers, usedPos] = await Promise.all([
+      getDeviceCount(license_key, 'manager'),
+      getDeviceCount(license_key, 'pos'),
     ]);
 
     return successResponse(res, {
       data: {
         devices,
         device_limits: {
-          manager_desktop: limits.manager_desktop,
-          manager_mobile: limits.manager_mobile,
-          used_manager_desktops: usedDesktop,
-          used_manager_mobiles: usedMobile,
-          plan_name: license.subscription?.plan_name || 'Basic',
+          manager_slots: limits.manager,
+          pos_slots: limits.pos,
+          used_managers: usedManagers,
+          used_pos: usedPos,
+          plan_name: license.subscription?.plan_name || 'Starter',
         },
       },
     });
@@ -769,19 +780,33 @@ async function reassignDevice(req, res) {
         include: { subscription: { select: { plan_name: true } } },
       });
       const limits = getPlanLimits(license?.subscription?.plan_name);
-      const normalizedPlatform = normalizePlatform(existing.platform);
-      const limit = normalizedPlatform === 'mobile' ? limits.manager_mobile : limits.manager_desktop;
+      const limit = limits.manager;
+      const used = await getDeviceCount(license_key, 'manager', deviceId);
+      if (used >= limit) {
+        await logDeviceAudit({
+          license_key, device_id: deviceId, device_type: new_device_type,
+          user_id: manager_username, action: 'reassign', result: 'denied',
+          details: { reason: 'limit_exceeded', limit, used }, ip_address: req.ip,
+        });
+        return errorResponse(res, `Manager device limit reached (${used}/${limit}). Upgrade your plan.`, 403);
+      }
+    }
 
-      if (limit !== null) {
-        const used = await getManagerDeviceCount(license_key, normalizedPlatform, deviceId);
-        if (used >= limit) {
-          await logDeviceAudit({
-            license_key, device_id: deviceId, device_type: new_device_type,
-            user_id: manager_username, action: 'reassign', result: 'denied',
-            details: { reason: 'limit_exceeded', limit, used }, ip_address: req.ip,
-          });
-          return errorResponse(res, `Manager ${normalizedPlatform} device limit reached (${limit})`, 403);
-        }
+    if (new_device_type === 'pos' && existing.device_type !== 'pos') {
+      const license = await prisma.license.findUnique({
+        where: { license_key },
+        include: { subscription: { select: { plan_name: true } } },
+      });
+      const limits = getPlanLimits(license?.subscription?.plan_name);
+      const limit = limits.pos;
+      const used = await getDeviceCount(license_key, 'pos', deviceId);
+      if (used >= limit) {
+        await logDeviceAudit({
+          license_key, device_id: deviceId, device_type: new_device_type,
+          user_id: manager_username, action: 'reassign', result: 'denied',
+          details: { reason: 'limit_exceeded', limit, used }, ip_address: req.ip,
+        });
+        return errorResponse(res, `POS device limit reached (${used}/${limit}). Upgrade your plan.`, 403);
       }
     }
 

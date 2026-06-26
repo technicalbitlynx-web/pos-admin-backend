@@ -26,6 +26,7 @@ const io = new Server(server, {
   transports: ['websocket', 'polling'],
 });
 
+app.set('io', io);   // make io accessible in controllers via req.app.get('io')
 setupWebSocket(io);
 
 async function start() {

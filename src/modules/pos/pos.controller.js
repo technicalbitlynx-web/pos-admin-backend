@@ -625,6 +625,16 @@ async function registerDevice(req, res) {
       ip_address: req.ip,
     });
 
+    // Notify all devices on this license that a new device was registered
+    const io = req.app.get('io');
+    if (io && license_key) {
+      io.to('license:' + license_key).emit('pos:device-registered', {
+        device_id,
+        device_name: row.device_name,
+        device_type: row.device_type,
+      });
+    }
+
     return successResponse(
       res,
       { data: { registered: true, device_type: row.device_type, device_id, device_name: row.device_name, platform: normalizedPlatform } },

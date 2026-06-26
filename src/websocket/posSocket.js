@@ -64,6 +64,9 @@ function setupWebSocket(io) {
       const ip = socket.handshake.address;
       sm.registerDevice(deviceId, socket.id, { ...licenseInfo, ip, licenseKey });
 
+      // Join a room keyed by license so we can broadcast to all devices on the same license
+      socket.join('license:' + licenseKey);
+
       // Broadcast to admin panel
       sm.broadcast('device:connected', {
         deviceId,
@@ -119,21 +122,17 @@ function setupWebSocket(io) {
             if (suppliers)  blob.suppliers   = JSON.stringify(suppliers);
             if (expenses)   blob.expenses    = JSON.stringify(expenses);
             if (quotations) blob.quotations  = JSON.stringify(quotations);
+            // Fire-and-forget: persist snapshot but don't block the broadcast
             if (Object.keys(blob).length) {
-              await prisma.posData.upsert({
+              prisma.posData.upsert({
                 where: { license_key: lk },
                 update: { ...blob, updated_at: new Date() },
                 create: { license_key: lk, ...blob },
               }).catch(() => {});
             }
           }
-          // Broadcast to all other POS devices with same license key
-          const sockets = await io.fetchSockets();
-          sockets.forEach(s => {
-            if (s.licenseKey === licenseKey && s.id !== socket.id && s.connectionType === 'pos') {
-              s.emit('pos:data-push', payload);
-            }
-          });
+          // Broadcast instantly using the license room (O(1), no fetchSockets scan)
+          socket.to('license:' + licenseKey).emit('pos:data-push', payload);
         } catch (err) {
           logger.error('pos:data-push error', { message: err.message });
         }

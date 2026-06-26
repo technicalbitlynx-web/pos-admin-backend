@@ -1,7 +1,6 @@
 const service = require('./admin.service');
 const { successResponse, errorResponse } = require('../../utils/helpers');
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../../config/database');
 
 async function createAdmin(req, res, next) {
   try {
@@ -69,14 +68,20 @@ async function getAuditLogs(req, res, next) {
 
 async function clearAllData(req, res, next) {
   try {
-    // Delete in dependency order; Client cascade removes Subscription, Payment, License, Invoice, Ticket, TicketReply
+    // Delete leaf tables first to satisfy FK constraints, then parents
+    await prisma.ticketReply.deleteMany({});
+    await prisma.invoice.deleteMany({});      // references Payment — must go before Payment
+    await prisma.payment.deleteMany({});      // references Subscription — must go before Subscription
+    await prisma.license.deleteMany({});
+    await prisma.subscription.deleteMany({});
+    await prisma.ticket.deleteMany({});
+    await prisma.client.deleteMany({});
     await prisma.posDeviceAuditLog.deleteMany({});
     await prisma.posSalesReport.deleteMany({});
     await prisma.posData.deleteMany({});
     await prisma.posOperator.deleteMany({});
     await prisma.licenseDevice.deleteMany({});
     await prisma.auditLog.deleteMany({});
-    await prisma.client.deleteMany({});
     successResponse(res, {}, 200, 'All data cleared');
   } catch (err) {
     next(err);

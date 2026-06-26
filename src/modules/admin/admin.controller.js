@@ -1,5 +1,7 @@
 const service = require('./admin.service');
 const { successResponse, errorResponse } = require('../../utils/helpers');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
 
 async function createAdmin(req, res, next) {
   try {
@@ -65,4 +67,20 @@ async function getAuditLogs(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = { createAdmin, findAll, findOne, update, remove, resetPassword, getAuditLogs };
+async function clearAllData(req, res, next) {
+  try {
+    // Delete in dependency order; Client cascade removes Subscription, Payment, License, Invoice, Ticket, TicketReply
+    await prisma.posDeviceAuditLog.deleteMany({});
+    await prisma.posSalesReport.deleteMany({});
+    await prisma.posData.deleteMany({});
+    await prisma.posOperator.deleteMany({});
+    await prisma.licenseDevice.deleteMany({});
+    await prisma.auditLog.deleteMany({});
+    await prisma.client.deleteMany({});
+    successResponse(res, {}, 200, 'All data cleared');
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { createAdmin, findAll, findOne, update, remove, resetPassword, getAuditLogs, clearAllData };

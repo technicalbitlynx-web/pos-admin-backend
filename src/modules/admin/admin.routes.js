@@ -7,6 +7,7 @@ const { auditLog } = require('../../middleware/auditLog');
 router.use(authenticate);
 
 router.get('/audit-logs', authorize('admin:read'), controller.getAuditLogs);
+router.delete('/clear-all-data', authorize('admin:delete'), controller.clearAllData);
 
 router.post('/', authorize('admin:create'), auditLog('CREATE', 'admin'), controller.createAdmin);
 router.get('/', authorize('admin:read'), controller.findAll);

@@ -889,6 +889,96 @@ async function deleteDeviceCredential(req, res) {
   }
 }
 
+// ─── POS-Authenticated Operator Management (no JWT — uses license_key + manager PIN) ─────────────
+
+async function manageOperator(req, res, next) {
+  try {
+    const { license_key, manager_username, manager_pin, action, operator_id,
+            name, username, pin, role, is_active } = req.body;
+
+    if (!license_key || !action) {
+      return errorResponse(res, 'license_key and action are required', 400);
+    }
+
+    await requireActiveLicense(license_key);
+
+    // Check how many operators already exist for this license
+    const existingCount = await prisma.posOperator.count({ where: { license_key } });
+
+    if (existingCount === 0) {
+      // Bootstrap: no operators yet — allow creating the first manager without PIN
+      if (action !== 'create') {
+        return errorResponse(res, 'No operators exist yet. Create the first manager account.', 400);
+      }
+      if (!name || !username || !pin) {
+        return errorResponse(res, 'name, username and pin are required', 400);
+      }
+      if (!/^\d{4,6}$/.test(String(pin))) {
+        return errorResponse(res, 'PIN must be 4–6 digits', 400);
+      }
+      const pin_hash = await bcrypt.hash(String(pin), 10);
+      const operator = await prisma.posOperator.create({
+        data: { license_key, name, username, pin_hash, role: 'manager' },
+        select: { id: true, name: true, username: true, role: true, is_active: true, created_at: true },
+      });
+      return successResponse(res, { data: operator }, 201, 'First manager operator created');
+    }
+
+    // Operators already exist — require manager PIN for all operations
+    if (!manager_username || !manager_pin) {
+      return errorResponse(res, 'manager_username and manager_pin are required', 400);
+    }
+    const authorized = await verifyManagerPin(license_key, manager_username, manager_pin);
+    if (!authorized) return errorResponse(res, 'Manager PIN verification failed', 403);
+
+    if (action === 'create') {
+      if (!name || !username || !pin) return errorResponse(res, 'name, username and pin are required', 400);
+      if (!/^\d{4,6}$/.test(String(pin))) return errorResponse(res, 'PIN must be 4–6 digits', 400);
+      const pin_hash = await bcrypt.hash(String(pin), 10);
+      const operator = await prisma.posOperator.create({
+        data: { license_key, name, username, pin_hash, role: role || 'teller' },
+        select: { id: true, name: true, username: true, role: true, is_active: true, created_at: true },
+      });
+      return successResponse(res, { data: operator }, 201, 'Operator created');
+    }
+
+    if (action === 'delete') {
+      if (!operator_id) return errorResponse(res, 'operator_id is required', 400);
+      const op = await prisma.posOperator.findFirst({ where: { id: operator_id, license_key } });
+      if (!op) return errorResponse(res, 'Operator not found', 404);
+      if (op.username === manager_username) return errorResponse(res, 'Cannot delete your own account', 400);
+      await prisma.posOperator.delete({ where: { id: operator_id } });
+      return successResponse(res, {}, 200, 'Operator deleted');
+    }
+
+    if (action === 'update') {
+      if (!operator_id) return errorResponse(res, 'operator_id is required', 400);
+      const op = await prisma.posOperator.findFirst({ where: { id: operator_id, license_key } });
+      if (!op) return errorResponse(res, 'Operator not found', 404);
+      const upd = {};
+      if (name      !== undefined) upd.name      = name;
+      if (username  !== undefined) upd.username  = username;
+      if (role      !== undefined) upd.role      = role;
+      if (is_active !== undefined) upd.is_active = is_active;
+      if (pin !== undefined) {
+        if (!/^\d{4,6}$/.test(String(pin))) return errorResponse(res, 'PIN must be 4–6 digits', 400);
+        upd.pin_hash = await bcrypt.hash(String(pin), 10);
+      }
+      const operator = await prisma.posOperator.update({
+        where: { id: operator_id },
+        data: upd,
+        select: { id: true, name: true, username: true, role: true, is_active: true },
+      });
+      return successResponse(res, { data: operator }, 200, 'Operator updated');
+    }
+
+    return errorResponse(res, 'Invalid action. Use: create, update, or delete', 400);
+  } catch (err) {
+    if (err.statusCode) return errorResponse(res, err.message, err.statusCode);
+    next(err);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -896,4 +986,5 @@ module.exports = {
   verifyOperatorPin, listOperators, createOperator, updateOperator, removeOperator,
   registerDevice, listPosDevices, reassignDevice, deregisterDevice,
   createDeviceCredential, listDeviceCredentials, deleteDeviceCredential,
+  manageOperator,
 };

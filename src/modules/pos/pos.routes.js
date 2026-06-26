@@ -14,6 +14,9 @@ router.get('/load-all',  posLimiter, controller.loadAllData);
 // Public — PIN verification (no JWT, authenticated by license_key in body)
 router.post('/operators/verify-pin', posLimiter, controller.verifyOperatorPin);
 
+// Public — POS-authenticated operator management (license_key + manager PIN, or bootstrap with no PIN)
+router.post('/operators/manage', posLimiter, controller.manageOperator);
+
 // Admin-only: operator CRUD
 router.get('/operators',      authenticate, authorize('operators:read'),  controller.listOperators);
 router.post('/operators',     authenticate, authorize('operators:write'), controller.createOperator);

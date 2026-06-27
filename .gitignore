@@ -8,4 +8,9 @@ logs/
 prisma/prisma/*.db
 prisma/prisma/*.db-journal
 
+# local dev sqlite
+dev.db
+*.db
+*.db-journal
+
 .vercel

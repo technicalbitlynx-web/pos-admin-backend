@@ -145,4 +145,97 @@ async function exportExcel(type, query) {
   return workbook;
 }
 
-module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportExcel };
+async function posOverview() {
+  const safeparse = (s) => {
+    if (!s) return [];
+    try { const a = JSON.parse(s); return Array.isArray(a) ? a : []; } catch { return []; }
+  };
+
+  const [allPosData, allSalesReports] = await Promise.all([
+    prisma.posData.findMany(),
+    prisma.posSalesReport.findMany({ orderBy: { report_date: 'asc' } }),
+  ]);
+
+  // Aggregate from PosSalesReport (dedicated daily summaries)
+  const reportTotals = allSalesReports.reduce(
+    (acc, r) => ({
+      sales: acc.sales + Number(r.total_sales),
+      profit: acc.profit + Number(r.total_profit),
+      items: acc.items + Number(r.items_sold),
+    }),
+    { sales: 0, profit: 0, items: 0 }
+  );
+
+  // Monthly trend grouped by YYYY-MM
+  const byMonthMap = {};
+  for (const r of allSalesReports) {
+    const month = r.report_date.slice(0, 7);
+    if (!byMonthMap[month]) byMonthMap[month] = { sales: 0, profit: 0, items: 0 };
+    byMonthMap[month].sales  += Number(r.total_sales);
+    byMonthMap[month].profit += Number(r.total_profit);
+    byMonthMap[month].items  += Number(r.items_sold);
+  }
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const byMonth = Object.entries(byMonthMap)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, v]) => ({
+      month: MONTHS[parseInt(key.split('-')[1]) - 1] + ' ' + key.split('-')[0],
+      sales: v.sales,
+      profit: v.profit,
+      items: v.items,
+    }));
+
+  // From PosData: capital invested and expenses per device
+  let capitalInvested = 0;
+  let totalExpenses = 0;
+  const byDevice = [];
+
+  for (const row of allPosData) {
+    const products  = safeparse(row.products);
+    const expenses  = safeparse(row.expenses);
+
+    const capital  = products.reduce((s, p) => s + Number(p.buy_price || 0) * Number(p.available_stock || 0), 0);
+    const expTotal = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
+
+    capitalInvested += capital;
+    totalExpenses   += expTotal;
+
+    // Per-device sales from PosSalesReport
+    const deviceReports = allSalesReports.filter((r) => r.license_key === row.license_key);
+    const devSales  = deviceReports.reduce((s, r) => s + Number(r.total_sales), 0);
+    const devProfit = deviceReports.reduce((s, r) => s + Number(r.total_profit), 0);
+    const devItems  = deviceReports.reduce((s, r) => s + Number(r.items_sold), 0);
+
+    byDevice.push({
+      license_key:      row.license_key,
+      products_count:   products.length,
+      capital_invested: capital,
+      expenses:         expTotal,
+      sales:            devSales,
+      profit:           devProfit,
+      items_sold:       devItems,
+      net_profit:       devProfit - expTotal,
+    });
+  }
+
+  const grossProfit = reportTotals.profit;
+  const netProfit   = grossProfit - totalExpenses;
+  const margin      = reportTotals.sales > 0 ? Math.round((grossProfit / reportTotals.sales) * 100) : 0;
+
+  return {
+    summary: {
+      total_sales:       reportTotals.sales,
+      gross_profit:      grossProfit,
+      total_expenses:    totalExpenses,
+      net_profit:        netProfit,
+      capital_invested:  capitalInvested,
+      items_sold:        reportTotals.items,
+      gross_margin_pct:  margin,
+      devices_count:     allPosData.length,
+    },
+    byMonth,
+    byDevice,
+  };
+}
+
+module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportExcel, posOverview };

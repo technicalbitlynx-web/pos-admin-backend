@@ -55,4 +55,11 @@ async function exportReport(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportReport };
+async function posOverview(req, res, next) {
+  try {
+    const data = await service.posOverview();
+    successResponse(res, { data });
+  } catch (err) { next(err); }
+}
+
+module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportReport, posOverview };

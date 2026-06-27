@@ -146,96 +146,130 @@ async function exportExcel(type, query) {
 }
 
 async function posOverview() {
-  const safeparse = (s) => {
-    if (!s) return [];
-    try { const a = JSON.parse(s); return Array.isArray(a) ? a : []; } catch { return []; }
-  };
+  const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthLabel = (key) => MN[parseInt(key.split('-')[1]) - 1] + ' \'' + key.split('-')[0].slice(2);
 
-  const [allPosData, allSalesReports] = await Promise.all([
-    prisma.posData.findMany(),
-    prisma.posSalesReport.findMany({ orderBy: { report_date: 'asc' } }),
+  const [approvedPayments, adminExpenses, officers] = await Promise.all([
+    prisma.payment.findMany({
+      where: { status: 'APPROVED' },
+      include: {
+        client:   { select: { business_name: true } },
+        recorder: { select: { id: true, name: true, commission_rate: true, role: true } },
+      },
+      orderBy: { date: 'desc' },
+    }),
+    prisma.adminExpense.findMany({ orderBy: { date: 'desc' } }),
+    prisma.adminUser.findMany({
+      where: { role: 'SALES_MANAGER', is_active: true },
+      select: { id: true, name: true, email: true, commission_rate: true },
+    }),
   ]);
 
-  // Aggregate from PosSalesReport (dedicated daily summaries)
-  const reportTotals = allSalesReports.reduce(
-    (acc, r) => ({
-      sales: acc.sales + Number(r.total_sales),
-      profit: acc.profit + Number(r.total_profit),
-      items: acc.items + Number(r.items_sold),
-    }),
-    { sales: 0, profit: 0, items: 0 }
-  );
+  // ── Subscription Revenue ──────────────────────────────────────────
+  const totalRevenue   = approvedPayments.reduce((s, p) => s + Number(p.amount), 0);
+  const uniqueClients  = new Set(approvedPayments.map((p) => p.client_id)).size;
 
-  // Monthly trend grouped by YYYY-MM
-  const byMonthMap = {};
-  for (const r of allSalesReports) {
-    const month = r.report_date.slice(0, 7);
-    if (!byMonthMap[month]) byMonthMap[month] = { sales: 0, profit: 0, items: 0 };
-    byMonthMap[month].sales  += Number(r.total_sales);
-    byMonthMap[month].profit += Number(r.total_profit);
-    byMonthMap[month].items  += Number(r.items_sold);
+  const byMethod = {};
+  approvedPayments.forEach((p) => { byMethod[p.method] = (byMethod[p.method] || 0) + Number(p.amount); });
+
+  // ── Admin Expenses ────────────────────────────────────────────────
+  const totalExpenses  = adminExpenses.reduce((s, e) => s + Number(e.amount), 0);
+  const expByCategory  = {};
+  adminExpenses.forEach((e) => { expByCategory[e.category] = (expByCategory[e.category] || 0) + Number(e.amount); });
+
+  // ── Officer Commissions ───────────────────────────────────────────
+  // Build a map: officerId → { officer meta, payments handled }
+  const officerMap = {};
+  for (const o of officers) {
+    officerMap[o.id] = { ...o, approved_amount: 0, payment_count: 0, commission_earned: 0 };
   }
-  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const byMonth = Object.entries(byMonthMap)
+  // Also include any officer that handled payments but isn't in active SALES_MANAGER list
+  for (const p of approvedPayments) {
+    if (p.recorder && p.recorder.role === 'SALES_MANAGER') {
+      const oid = p.recorder.id;
+      if (!officerMap[oid]) {
+        officerMap[oid] = { id: oid, name: p.recorder.name, email: '', commission_rate: p.recorder.commission_rate, approved_amount: 0, payment_count: 0, commission_earned: 0 };
+      }
+      officerMap[oid].approved_amount += Number(p.amount);
+      officerMap[oid].payment_count   += 1;
+    }
+  }
+  for (const o of Object.values(officerMap)) {
+    o.commission_earned = +(o.approved_amount * o.commission_rate).toFixed(2);
+  }
+  const officerRows = Object.values(officerMap).sort((a, b) => b.commission_earned - a.commission_earned);
+  const totalCommissions = officerRows.reduce((s, o) => s + o.commission_earned, 0);
+
+  // ── Net Profit ────────────────────────────────────────────────────
+  const netProfit = totalRevenue - totalExpenses - totalCommissions;
+
+  // ── Monthly Trend ─────────────────────────────────────────────────
+  const mMap = {};
+  for (const p of approvedPayments) {
+    const d   = new Date(p.date);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!mMap[key]) mMap[key] = { revenue: 0, expenses: 0, commissions: 0 };
+    mMap[key].revenue += Number(p.amount);
+    if (p.recorder?.role === 'SALES_MANAGER') {
+      mMap[key].commissions += Number(p.amount) * (p.recorder.commission_rate || 0);
+    }
+  }
+  for (const e of adminExpenses) {
+    const d   = new Date(e.date);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!mMap[key]) mMap[key] = { revenue: 0, expenses: 0, commissions: 0 };
+    mMap[key].expenses += Number(e.amount);
+  }
+  const byMonth = Object.entries(mMap)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, v]) => ({
-      month: MONTHS[parseInt(key.split('-')[1]) - 1] + ' ' + key.split('-')[0],
-      sales: v.sales,
-      profit: v.profit,
-      items: v.items,
+      month: monthLabel(key),
+      revenue:     +v.revenue.toFixed(2),
+      expenses:    +v.expenses.toFixed(2),
+      commissions: +v.commissions.toFixed(2),
+      net:         +(v.revenue - v.expenses - v.commissions).toFixed(2),
     }));
-
-  // From PosData: capital invested and expenses per device
-  let capitalInvested = 0;
-  let totalExpenses = 0;
-  const byDevice = [];
-
-  for (const row of allPosData) {
-    const products  = safeparse(row.products);
-    const expenses  = safeparse(row.expenses);
-
-    const capital  = products.reduce((s, p) => s + Number(p.buy_price || 0) * Number(p.available_stock || 0), 0);
-    const expTotal = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
-
-    capitalInvested += capital;
-    totalExpenses   += expTotal;
-
-    // Per-device sales from PosSalesReport
-    const deviceReports = allSalesReports.filter((r) => r.license_key === row.license_key);
-    const devSales  = deviceReports.reduce((s, r) => s + Number(r.total_sales), 0);
-    const devProfit = deviceReports.reduce((s, r) => s + Number(r.total_profit), 0);
-    const devItems  = deviceReports.reduce((s, r) => s + Number(r.items_sold), 0);
-
-    byDevice.push({
-      license_key:      row.license_key,
-      products_count:   products.length,
-      capital_invested: capital,
-      expenses:         expTotal,
-      sales:            devSales,
-      profit:           devProfit,
-      items_sold:       devItems,
-      net_profit:       devProfit - expTotal,
-    });
-  }
-
-  const grossProfit = reportTotals.profit;
-  const netProfit   = grossProfit - totalExpenses;
-  const margin      = reportTotals.sales > 0 ? Math.round((grossProfit / reportTotals.sales) * 100) : 0;
 
   return {
     summary: {
-      total_sales:       reportTotals.sales,
-      gross_profit:      grossProfit,
+      total_revenue:     totalRevenue,
       total_expenses:    totalExpenses,
+      total_commissions: totalCommissions,
       net_profit:        netProfit,
-      capital_invested:  capitalInvested,
-      items_sold:        reportTotals.items,
-      gross_margin_pct:  margin,
-      devices_count:     allPosData.length,
+      payment_count:     approvedPayments.length,
+      unique_clients:    uniqueClients,
+      active_officers:   officerRows.length,
+      expense_count:     adminExpenses.length,
     },
     byMonth,
-    byDevice,
+    byMethod,
+    expensesByCategory: expByCategory,
+    officers: officerRows,
+    recentPayments: approvedPayments.slice(0, 20).map((p) => ({
+      id: p.id, client: p.client?.business_name || 'Unknown',
+      amount: Number(p.amount), method: p.method, date: p.date,
+      officer: p.recorder?.name || null,
+    })),
+    recentExpenses: adminExpenses.slice(0, 10).map((e) => ({
+      id: e.id, amount: Number(e.amount), category: e.category, description: e.description, date: e.date,
+    })),
   };
 }
 
-module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportExcel, posOverview };
+async function getCapitalConfig() {
+  const configs = await prisma.adminConfig.findMany({ where: { key: { in: ['capital_apk', 'capital_exe'] } } });
+  const result = { apk: 0, exe: 0 };
+  configs.forEach((c) => { result[c.key.replace('capital_', '')] = Number(c.value) || 0; });
+  return result;
+}
+
+async function setCapitalConfig({ apk, exe }) {
+  const { randomUUID } = require('crypto');
+  await Promise.all([
+    prisma.adminConfig.upsert({ where: { key: 'capital_apk' }, update: { value: String(Number(apk) || 0) }, create: { id: randomUUID(), key: 'capital_apk', value: String(Number(apk) || 0) } }),
+    prisma.adminConfig.upsert({ where: { key: 'capital_exe' }, update: { value: String(Number(exe) || 0) }, create: { id: randomUUID(), key: 'capital_exe', value: String(Number(exe) || 0) } }),
+  ]);
+  return { apk: Number(apk) || 0, exe: Number(exe) || 0 };
+}
+
+module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportExcel, posOverview, getCapitalConfig, setCapitalConfig };

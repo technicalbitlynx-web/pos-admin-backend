@@ -62,4 +62,19 @@ async function posOverview(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportReport, posOverview };
+async function getCapitalConfig(req, res, next) {
+  try {
+    const data = await service.getCapitalConfig();
+    successResponse(res, { data });
+  } catch (err) { next(err); }
+}
+
+async function setCapitalConfig(req, res, next) {
+  try {
+    const { apk, exe } = req.body;
+    const data = await service.setCapitalConfig({ apk, exe });
+    successResponse(res, { data, message: 'Capital config updated' });
+  } catch (err) { next(err); }
+}
+
+module.exports = { revenue, activeClients, expiredLicenses, monthlyPerformance, exportReport, posOverview, getCapitalConfig, setCapitalConfig };

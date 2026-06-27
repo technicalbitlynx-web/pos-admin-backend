@@ -257,6 +257,13 @@ model AdminExpense {
   creator AdminUser? @relation(fields: [created_by], references: [id])
 }
 
+model AdminConfig {
+  id         String   @id @default(uuid())
+  key        String   @unique
+  value      String
+  updated_at DateTime @updatedAt
+}
+
 model PosOperator {
   id          String   @id @default(uuid())
   license_key String
